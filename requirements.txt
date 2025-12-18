@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+mlflow
+python-dotenv
+sqlalchemy
+psycopg2-binary
+matplotlib
+streamlit
+joblib

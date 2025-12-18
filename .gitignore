@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Env vars
+.env
+
+# Data (we will not commit raw data)
+data/raw/
+data/processed/
+data/artifacts/
+
+# OS / editor
+.DS_Store
+.vscode/
