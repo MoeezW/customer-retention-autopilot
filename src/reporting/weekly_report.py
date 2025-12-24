@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import mlflow
+import mlflow.sklearn
 from mlflow.tracking import MlflowClient
 from sqlalchemy import create_engine, text
 
@@ -41,29 +42,19 @@ class ModelSummary:
 # MLflow helpers
 # -----------------------------
 
-def get_latest_model_summary() -> ModelSummary:
+def get_model_summary_by_run_id(model_run_id: str) -> ModelSummary:
     """
-    Pull the most recent MLflow run from our experiment.
+    Load a specific MLflow run by run_id.
 
-    This keeps reports tied to the model currently being used in production scoring.
+    This ties the weekly batch report to the *exact* model that produced the scores,
+    which is the audit-correct enterprise pattern.
     """
     if settings.mlflow_tracking_uri:
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
 
     client = MlflowClient()
-    exp = client.get_experiment_by_name(EXPERIMENT_NAME)
-    if exp is None:
-        raise ValueError(f"MLflow experiment not found: {EXPERIMENT_NAME}")
+    run = client.get_run(model_run_id)
 
-    runs = client.search_runs(
-        experiment_ids=[exp.experiment_id],
-        order_by=["attributes.start_time DESC"],
-        max_results=1,
-    )
-    if not runs:
-        raise ValueError("No MLflow runs found. Train a model first.")
-
-    run = runs[0]
     return ModelSummary(
         model_run_id=run.info.run_id,
         params=dict(run.data.params),
@@ -133,6 +124,72 @@ def load_dispatch_log(engine, run_id: str) -> pd.DataFrame:
     )
 
 
+def get_actual_churn_rate_in_segment(engine, run_id: str, segment: str) -> float:
+    """
+    Demo-only: because this dataset contains labels, we can compute the realized churn rate
+    within a segment (HIGH/MEDIUM/LOW) as a sanity check for the impact estimate.
+
+    In a real weekly scoring pipeline, you usually won't have churn outcomes yet for the current week.
+    """
+    q = text("""
+        SELECT AVG(d.churn::float) AS churn_rate
+        FROM churn_segments s
+        JOIN churn_dataset d ON s.customer_id = d.customer_id
+        WHERE s.run_id = :run_id AND s.segment = :segment;
+    """)
+    df = pd.read_sql_query(q, con=engine, params={"run_id": run_id, "segment": segment})
+    if df.empty or df.loc[0, "churn_rate"] is None:
+        return 0.0
+    return float(df.loc[0, "churn_rate"])
+
+
+# -----------------------------
+# Top drivers (LogReg coefficients)
+# -----------------------------
+
+def get_logreg_top_drivers(mlflow_model_uri: str, top_n: int = 12) -> pd.DataFrame:
+    """
+    Extract 'top drivers' for a logistic regression pipeline:
+    - Load the sklearn Pipeline from MLflow
+    - Grab one-hot feature names from the ColumnTransformer
+    - Grab LogisticRegression coefficients
+    - Rank by absolute coefficient magnitude
+
+    Interpretation:
+    - Positive coefficient -> higher churn risk
+    - Negative coefficient -> lower churn risk
+
+    Notes:
+    - Coefficients are associative, not causal.
+    - With one-hot, each category becomes a separate indicator feature.
+    """
+    clf = mlflow.sklearn.load_model(mlflow_model_uri)
+
+    # Our training pipeline is expected to have these named steps
+    if not hasattr(clf, "named_steps"):
+        raise ValueError("Expected an sklearn Pipeline with named_steps (preprocess, model).")
+
+    if "preprocess" not in clf.named_steps or "model" not in clf.named_steps:
+        raise ValueError("Expected pipeline steps named 'preprocess' and 'model'. Check your training code.")
+
+    pre = clf.named_steps["preprocess"]
+    model = clf.named_steps["model"]
+
+    if not hasattr(model, "coef_"):
+        raise ValueError("Model does not expose coef_. Top drivers not available for this model type.")
+
+    # ColumnTransformer can emit expanded names like: cat__contract_Month-to-month
+    feature_names = pre.get_feature_names_out()
+    coefs = model.coef_.ravel()
+
+    df = pd.DataFrame({"feature": feature_names, "coef": coefs})
+    df["abs_coef"] = df["coef"].abs()
+    df = df.sort_values("abs_coef", ascending=False).head(top_n).copy()
+
+    df["direction"] = df["coef"].apply(lambda x: "↑ churn risk" if x > 0 else "↓ churn risk")
+    return df[["feature", "coef", "direction"]]
+
+
 # -----------------------------
 # Plot helpers
 # -----------------------------
@@ -182,11 +239,11 @@ class ImpactAssumptions:
     Keep assumptions explicit.
     This is what makes the report defensible.
     """
-    arpu_monthly: float = 60.0          # Average revenue per user per month
-    contacted_segment: str = "HIGH"     # We estimate impact for a targeted segment
-    contact_rate_in_segment: float = 1.0  # fraction of that segment contacted (1.0 if we contact all HIGH)
+    arpu_monthly: float = 60.0                 # Average revenue per user per month
+    contacted_segment: str = "HIGH"            # We estimate impact for a targeted segment
+    contact_rate_in_segment: float = 1.0       # fraction of that segment contacted
     baseline_churn_rate_in_segment: float = 0.08  # expected churn without intervention
-    save_rate_from_intervention: float = 0.20     # fraction of churners saved by intervention
+    save_rate_from_intervention: float = 0.20  # fraction of churners saved by intervention
 
 
 def estimate_business_impact(
@@ -234,6 +291,7 @@ def write_summary_markdown(
     run_ctx: RunContext,
     model_summary: ModelSummary,
     totals: dict,
+    top_drivers_df: pd.DataFrame,
     impact: dict,
 ) -> None:
     """
@@ -246,7 +304,7 @@ def write_summary_markdown(
     p = model_summary.params
 
     lines = []
-    lines.append(f"# Weekly Retention Autopilot Report")
+    lines.append("# Weekly Retention Autopilot Report")
     lines.append("")
     lines.append(f"- Generated at: **{now}**")
     lines.append(f"- Batch run_id: **{run_ctx.batch_run_id}**")
@@ -256,12 +314,12 @@ def write_summary_markdown(
     lines.append("## 1) Operational Summary")
     lines.append("")
     lines.append(f"- Total customers scored: **{totals['total_scored']}**")
-    lines.append(f"- Segments:")
+    lines.append("- Segments:")
     lines.append(f"  - HIGH: **{totals['seg_high']}**")
     lines.append(f"  - MEDIUM: **{totals['seg_medium']}**")
     lines.append(f"  - LOW: **{totals['seg_low']}**")
     lines.append("")
-    lines.append(f"- Actions:")
+    lines.append("- Actions:")
     lines.append(f"  - Emails queued/sent (simulated): **{totals['emails_sent']}**")
     lines.append("")
     lines.append("### Actions by template")
@@ -269,23 +327,34 @@ def write_summary_markdown(
         lines.append(f"- **{k}**: {v}")
     lines.append("")
 
-    lines.append("## 2) Model Performance (latest training run)")
+    lines.append("## 2) Model Performance (model used for this batch)")
     lines.append("")
-    lines.append(f"- Chosen threshold policy: **{p.get('chosen_threshold', 'N/A')}** (max_contact_rate={p.get('max_contact_rate', 'N/A')})")
+    lines.append(
+        f"- Chosen threshold policy: **{p.get('chosen_threshold', 'N/A')}** "
+        f"(max_contact_rate={p.get('max_contact_rate', 'N/A')})"
+    )
     lines.append(f"- Validation ROC-AUC: **{m.get('val_roc_auc', float('nan')):.4f}**")
     lines.append(f"- Validation PR-AUC: **{m.get('val_pr_auc', float('nan')):.4f}**")
     lines.append(f"- Test ROC-AUC: **{m.get('test_roc_auc', float('nan')):.4f}**")
     lines.append(f"- Test PR-AUC: **{m.get('test_pr_auc', float('nan')):.4f}**")
-    lines.append(f"- Test Precision / Recall / F1: **{m.get('test_precision', float('nan')):.3f} / {m.get('test_recall', float('nan')):.3f} / {m.get('test_f1', float('nan')):.3f}**")
+    lines.append(
+        f"- Test Precision / Recall / F1: **"
+        f"{m.get('test_precision', float('nan')):.3f} / "
+        f"{m.get('test_recall', float('nan')):.3f} / "
+        f"{m.get('test_f1', float('nan')):.3f}**"
+    )
     lines.append("")
 
-    lines.append("## 3) Top Drivers (interpretability note)")
+    lines.append("## 3) Top Drivers (Logistic Regression coefficients)")
     lines.append("")
-    lines.append(
-        "This model is a Logistic Regression baseline with one-hot encoded categorical features. "
-        "In Block F (optional), we can extract the highest-magnitude coefficients as ‘top drivers’ "
-        "and include a ranked list (e.g., month-to-month contract, high monthly charges, low tenure)."
-    )
+    lines.append("Top features by absolute coefficient magnitude (post one-hot encoding).")
+    lines.append("")
+    lines.append("| Feature | Coef | Direction |")
+    lines.append("|---|---:|---|")
+    for _, r in top_drivers_df.iterrows():
+        lines.append(f"| {r['feature']} | {float(r['coef']):.4f} | {r['direction']} |")
+    lines.append("")
+    lines.append("Note: coefficients are not causal; they reflect association under this dataset + preprocessing.")
     lines.append("")
 
     lines.append("## 4) Business Impact Estimate (toy model, assumptions explicit)")
@@ -302,6 +371,12 @@ def write_summary_markdown(
     lines.append(f"- Baseline churners (est): **{impact['baseline_churners_est']:.1f}**")
     lines.append(f"- Saved churners (est): **{impact['saved_churners_est']:.1f}**")
     lines.append(f"- Estimated monthly revenue protected: **${impact['monthly_revenue_protected_est']:.2f}**")
+    lines.append("")
+    lines.append(
+        "Realism note: these numbers are small because the demo dataset is ~7k customers. "
+        "In production, impact scales roughly linearly with customer base size and campaign scope "
+        "(e.g., for 100k customers, multiply estimates by ~14× under similar segment proportions)."
+    )
     lines.append("")
 
     outpath.write_text("\n".join(lines), encoding="utf-8")
@@ -326,7 +401,7 @@ def main() -> None:
 
     engine = create_engine(settings.database_url, future=True)
 
-    # Figure out what model was used for this batch run
+    # Figure out what model was used for this batch run (this is correct; no extra work needed)
     run_ctx = get_run_context(engine, run_id)
 
     # Load tables
@@ -348,25 +423,45 @@ def main() -> None:
         "actions_by_template": actions_df[actions_df["action_type"] != "NONE"]["template_id"].value_counts().to_dict(),
     }
 
-    # Model performance summary (latest training run)
-    model_summary = get_latest_model_summary()
+    # Model performance summary (for the exact model used by this batch)
+    model_summary = get_model_summary_by_run_id(run_ctx.model_run_id)
 
-    # Business impact estimate (explicit assumptions)
-    impact = estimate_business_impact(segments_df)
+    # Build a model URI to load the exact pipeline used (for top drivers)
+    model_uri = f"runs:/{run_ctx.model_run_id}/sklearn-model"
+    top_drivers_df = get_logreg_top_drivers(model_uri, top_n=12)
 
     # Output folder for this run
     out_dir = Path("reports/weekly") / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Save top drivers as a CSV artifact too
+    top_drivers_df.to_csv(out_dir / "top_drivers.csv", index=False)
+
     # Plots
     plot_risk_distribution(scores_df, out_dir / "risk_distribution.png")
     plot_actions_by_template(actions_df, out_dir / "actions_by_template.png")
 
+    # Business impact estimate:
+    # For demo credibility we anchor baseline churn rate in HIGH to the realized churn rate in that segment.
+    # (In real weekly scoring you wouldn't know outcomes yet.)
+    actual_high_churn_rate = get_actual_churn_rate_in_segment(engine, run_id, "HIGH")
+    impact = estimate_business_impact(
+        segments_df,
+        assumptions=ImpactAssumptions(
+            arpu_monthly=60.0,
+            contacted_segment="HIGH",
+            contact_rate_in_segment=1.0,
+            baseline_churn_rate_in_segment=actual_high_churn_rate if actual_high_churn_rate > 0 else 0.08,
+            save_rate_from_intervention=0.20,
+        ),
+    )
+
     # Write summary.md
-    write_summary_markdown(out_dir / "summary.md", run_ctx, model_summary, totals, impact)
+    write_summary_markdown(out_dir / "summary.md", run_ctx, model_summary, totals, top_drivers_df, impact)
 
     logger.info(f"Weekly report generated ✅ at: {out_dir}")
     logger.info(f"- {out_dir / 'summary.md'}")
+    logger.info(f"- {out_dir / 'top_drivers.csv'}")
     logger.info(f"- {out_dir / 'risk_distribution.png'}")
     logger.info(f"- {out_dir / 'actions_by_template.png'}")
 
