@@ -17,4 +17,9 @@ data/artifacts/
 
 # OS / editor
 .DS_Store
-.vscode/
+.vscode/mlruns/
+mlflow.db
+mlartifacts/
+data/artifacts/
+data/raw/
+reports/
