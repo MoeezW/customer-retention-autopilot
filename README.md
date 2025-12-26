@@ -36,7 +36,7 @@ flowchart LR
     H --> K[Streamlit Dashboard]
     J --> L[reports weekly run summary md and plots]
     I --> M[email previews and action dispatch log]
-
+```
 
 -- Quickstart --
 ----------------
