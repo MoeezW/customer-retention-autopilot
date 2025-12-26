@@ -23,19 +23,19 @@ A small, end-to-end “internal tool”-style system that predicts customer chur
 
 ```mermaid
 flowchart LR
-    A[Raw CSV] --> B[ETL: extract/transform/load]
-    B --> C[(Postgres Warehouse)]
+    A[Raw CSV] --> B[ETL: extract transform load]
+    B --> C[Postgres Warehouse]
     C --> D[Feature Builder]
     D --> E[Train Model]
     E --> F[MLflow Tracking]
     C --> G[Batch Scoring Job]
     F --> G
-    G --> H[(Postgres Tables: scores/segments/actions)]
-    H --> I[Automation: send_actions (simulated)]
+    G --> H[Postgres Tables: scores segments actions]
+    H --> I[Automation send actions simulated]
     H --> J[Weekly Report Generator]
     H --> K[Streamlit Dashboard]
-    J --> L[reports/weekly/<run_id>/summary.md + plots]
-    I --> M[email_previews/ + action_dispatch_log]
+    J --> L[reports weekly run summary md and plots]
+    I --> M[email previews and action dispatch log]
 
 
 -- Quickstart --
