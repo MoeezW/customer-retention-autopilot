@@ -10,7 +10,7 @@ __pycache__/
 # Env vars
 .env
 
-# Data (we will not commit raw data)
+# Data (make sure to not commit raw data)
 data/raw/
 data/processed/
 data/artifacts/
